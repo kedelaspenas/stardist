@@ -8,6 +8,7 @@ from tqdm import tqdm
 from collections import namedtuple
 
 import keras.backend as K
+from keras import metrics
 from keras.utils import Sequence
 from keras.optimizers import Adam
 from keras.callbacks import ReduceLROnPlateau, TensorBoard
@@ -63,12 +64,16 @@ def kld(y_true, y_pred):
     y_pred = K.clip(y_pred, K.epsilon(), 1)
     return K.mean(K.binary_crossentropy(y_true, y_pred) - K.binary_crossentropy(y_true, y_true), axis=-1)
 
+def accuracy(y_true, y_pred):
+    y_true = K.argmax(y_true, axis=-1)
+    y_pred = K.argmax(y_pred, axis=-1)
+    return keras.metrics.accuracy(y_true, y_pred)
 
 
 class StarDistDataBase(Sequence):
 
     def __init__(self, X, Y, n_rays, grid, batch_size, patch_size, use_gpu=False, maxfilter_cache=True, maxfilter_patch_size=None, augmenter=None):
-
+        
         X = [x.astype(np.float32, copy=False) for x in X]
         # Y = [y.astype(np.uint16,  copy=False) for y in Y]
 
@@ -198,9 +203,10 @@ class StarDistBase(BaseModel):
         input_mask = self.keras_model.inputs[1] # second input layer is mask for dist loss
         dist_loss = {'mse': masked_loss_mse, 'mae': masked_loss_mae}[self.config.train_dist_loss](input_mask, reg_weight=self.config.train_background_reg)
         prob_loss = 'binary_crossentropy'
-        self.keras_model.compile(optimizer, loss=[prob_loss, dist_loss],
+        seg_loss = 'categorical_crossentropy'
+        self.keras_model.compile(optimizer, loss=[prob_loss, dist_loss, seg_loss],
                                             loss_weights = list(self.config.train_loss_weights),
-                                            metrics={'prob': kld, 'dist': [masked_metric_mae(input_mask),masked_metric_mse(input_mask)]})
+                                            metrics={'prob': kld, 'dist': [masked_metric_mae(input_mask),masked_metric_mse(input_mask)], 'seg': metrics.categorical_accuracy})
 
         self.callbacks = []
         if self.basedir is not None:
@@ -282,8 +288,8 @@ class StarDistBase(BaseModel):
 
         def predict_direct(tile):
             sh = list(tile.shape); sh[channel] = 1; dummy = np.empty(sh,np.float32)
-            prob, dist = self.keras_model.predict([tile[np.newaxis],dummy[np.newaxis]], **predict_kwargs)
-            return prob[0], dist[0]
+            prob, dist, seg = self.keras_model.predict([tile[np.newaxis],dummy[np.newaxis]], **predict_kwargs)
+            return prob[0], dist[0], seg[0]
 
         if np.prod(n_tiles) > 1:
             tiling_axes   = axes_net.replace('C','') # axes eligible for tiling
@@ -295,7 +301,7 @@ class StarDistBase(BaseModel):
                 _raise(ValueError("entry of n_tiles > 1 only allowed for axes '%s'" % tiling_axes)))
 
             sh = [s//grid_dict.get(a,1) for a,s in zip(axes_net,x.shape)]
-            sh[channel] = 1;                  prob = np.empty(sh,np.float32)
+            sh[channel] = 1;                  prob = np.empty(sh,np.float32); seg = np.empty(sh,np.float32)
             sh[channel] = self.config.n_rays; dist = np.empty(sh,np.float32)
 
             n_block_overlaps = [int(np.ceil(overlap/blocksize)) for overlap, blocksize
@@ -303,7 +309,7 @@ class StarDistBase(BaseModel):
 
             for tile, s_src, s_dst in tqdm(tile_iterator(x, n_tiles, block_sizes=axes_net_div_by, n_block_overlaps=n_block_overlaps),
                                            disable=(not show_tile_progress), total=np.prod(n_tiles)):
-                prob_tile, dist_tile = predict_direct(tile)
+                prob_tile, dist_tile, seg_tile = predict_direct(tile)
                 # account for grid
                 s_src = [slice(s.start//grid_dict.get(a,1),s.stop//grid_dict.get(a,1)) for s,a in zip(s_src,axes_net)]
                 s_dst = [slice(s.start//grid_dict.get(a,1),s.stop//grid_dict.get(a,1)) for s,a in zip(s_dst,axes_net)]
@@ -314,18 +320,21 @@ class StarDistBase(BaseModel):
                 # print(s_src,s_dst)
                 prob[s_dst] = prob_tile[s_src]
                 dist[s_dst] = dist_tile[s_src]
+                seg[s_dst] = seg_tile[s_src]
 
         else:
-            prob, dist = predict_direct(x)
+            prob, dist, seg = predict_direct(x)
 
         prob = resizer.after(prob, axes_net)
         dist = resizer.after(dist, axes_net)
+        seg = resizer.after(seg, axes_net)
         dist = np.maximum(1e-3, dist) # avoid small/negative dist values to prevent problems with Qhull
 
         prob = np.take(prob,0,axis=channel)
+        seg = np.argmax(seg, axis=-1)
         dist = np.moveaxis(dist,channel,-1)
 
-        return prob, dist
+        return prob, dist, seg
 
 
     def predict_instances(self, img, axes=None, normalizer=None, prob_thresh=None, nms_thresh=None,
@@ -380,7 +389,7 @@ class StarDistBase(BaseModel):
         _permute_axes = self._make_permute_axes(_axes, _axes_net)
         _shape_inst   = tuple(s for s,a in zip(_permute_axes(img).shape, _axes_net) if a != 'C')
 
-        prob, dist = self.predict(img, axes=axes, normalizer=normalizer, n_tiles=n_tiles, show_tile_progress=show_tile_progress, **predict_kwargs)
+        prob, dist, _ = self.predict(img, axes=axes, normalizer=normalizer, n_tiles=n_tiles, show_tile_progress=show_tile_progress, **predict_kwargs)
         return self._instances_from_prediction(_shape_inst, prob, dist, prob_thresh=prob_thresh, nms_thresh=nms_thresh, overlap_label = overlap_label, **nms_kwargs)
 
 
@@ -425,11 +434,11 @@ class StarDistBase(BaseModel):
             else:
                 return {**predict_kwargs, 'n_tiles': self._guess_n_tiles(x), 'show_tile_progress': False}
 
-        Yhat_val = [self.predict(x, **_predict_kwargs(x)) for x in X_val]
+        Yhat_val = [self.predict(x, **_predict_kwargs(x))[:2] for x in X_val]
 
         opt_prob_thresh, opt_measure, opt_nms_thresh = None, -np.inf, None
         for _opt_nms_thresh in nms_threshs:
-            _opt_prob_thresh, _opt_measure = optimize_threshold(Y_val, Yhat_val, model=self, nms_thresh=_opt_nms_thresh, iou_threshs=iou_threshs, **optimize_kwargs)
+            _opt_prob_thresh, _opt_measure = optimize_threshold(Y_val[:2], Yhat_val, model=self, nms_thresh=_opt_nms_thresh, iou_threshs=iou_threshs, **optimize_kwargs)
             if _opt_measure > opt_measure:
                 opt_prob_thresh, opt_measure, opt_nms_thresh = _opt_prob_thresh, _opt_measure, _opt_nms_thresh
         opt_threshs = dict(prob=opt_prob_thresh, nms=opt_nms_thresh)

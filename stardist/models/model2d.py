@@ -71,13 +71,15 @@ class StarDistData2D(StarDistDataBase):
             X = np.expand_dims(X,-1)
         prob = np.expand_dims(prob,-1)
         dist_mask = np.expand_dims(dist_mask,-1)
+        labels = np.stack([Y, np.logical_not(Y)], axis=3)
 
         # subsample wth given grid
         dist_mask = dist_mask[self.ss_grid]
         prob      = prob[self.ss_grid]
         dist      = dist[self.ss_grid]
+        labels    = labels[self.ss_grid]
 
-        return [X,dist_mask], [prob,dist]
+        return [X,dist_mask], [prob,dist,labels]
 
 
 
@@ -172,7 +174,12 @@ class Config2D(BaseConfig):
             self.unet_batch_norm       = False
             self.unet_dropout          = 0.0
             self.unet_prefix           = ''
-            self.net_conv_after_unet   = 128
+            self.net_conv_after_unet   = 256
+
+        elif self.backbone == 'deeplab':
+            pass
+
+
         else:
             # TODO: resnet backbone for 2D model?
             raise ValueError("backbone '%s' not supported." % self.backbone)
@@ -190,7 +197,7 @@ class Config2D(BaseConfig):
         self.train_background_reg      = 1e-4
 
         self.train_dist_loss           = 'mae'
-        self.train_loss_weights        = 1,0.2
+        self.train_loss_weights        = 1,0.2,0.2
         self.train_epochs              = 400
         self.train_steps_per_epoch     = 100
         self.train_learning_rate       = 0.0003
@@ -250,7 +257,7 @@ class StarDist2D(StarDistBase):
 
 
     def _build(self):
-        self.config.backbone == 'unet' or _raise(NotImplementedError())
+        #self.config.backbone == 'unet' or _raise(NotImplementedError())
 
         input_img  = Input(self.config.net_input_shape, name='input')
         if backend_channels_last():
@@ -259,27 +266,34 @@ class StarDist2D(StarDistBase):
             grid_shape = (1,) + tuple(n//g if n is not None else None for g,n in zip(self.config.grid, self.config.net_mask_shape[1:]))
         input_mask = Input(grid_shape, name='dist_mask')
 
-        unet_kwargs = {k[len('unet_'):]:v for (k,v) in vars(self.config).items() if k.startswith('unet_')}
+        if self.config.backbone == 'unet':
+            unet_kwargs = {k[len('unet_'):]:v for (k,v) in vars(self.config).items() if k.startswith('unet_')}
 
-        # maxpool input image to grid size
-        pooled = np.array([1,1])
-        pooled_img = input_img
-        while tuple(pooled) != tuple(self.config.grid):
-            pool = 1 + (np.asarray(self.config.grid) > pooled)
-            pooled *= pool
-            for _ in range(self.config.unet_n_conv_per_depth):
-                pooled_img = Conv2D(self.config.unet_n_filter_base, self.config.unet_kernel_size,
-                                    padding='same', activation=self.config.unet_activation)(pooled_img)
-            pooled_img = MaxPooling2D(pool)(pooled_img)
+            # maxpool input image to grid size
+            pooled = np.array([1,1])
+            pooled_img = input_img
+            while tuple(pooled) != tuple(self.config.grid):
+                pool = 1 + (np.asarray(self.config.grid) > pooled)
+                pooled *= pool
+                for _ in range(self.config.unet_n_conv_per_depth):
+                    pooled_img = Conv2D(self.config.unet_n_filter_base, self.config.unet_kernel_size,
+                                        padding='same', activation=self.config.unet_activation)(pooled_img)
+                pooled_img = MaxPooling2D(pool)(pooled_img)
 
-        unet        = unet_block(**unet_kwargs)(pooled_img)
-        if self.config.net_conv_after_unet > 0:
-            unet    = Conv2D(self.config.net_conv_after_unet, self.config.unet_kernel_size,
-                             name='features', padding='same', activation=self.config.unet_activation)(unet)
+            unet        = unet_block(**unet_kwargs)(pooled_img)
+            if self.config.net_conv_after_unet > 0:
+                unet    = Conv2D(self.config.net_conv_after_unet, self.config.unet_kernel_size,
+                                 name='features', padding='same', activation=self.config.unet_activation)(unet)
+            features = unet
+        elif self.config.backbone == 'deeplab': #resnet-101 backbone
+            pass
+        else:
+            _raise(NotImplementedError())
 
-        output_prob  = Conv2D(1,                  (1,1), name='prob', padding='same', activation='sigmoid')(unet)
-        output_dist  = Conv2D(self.config.n_rays, (1,1), name='dist', padding='same', activation='linear')(unet)
-        return Model([input_img,input_mask], [output_prob,output_dist])
+        output_prob  = Conv2D(1,                  (1,1), name='prob', padding='same', activation='sigmoid')(features)
+        output_dist  = Conv2D(self.config.n_rays, (1,1), name='dist', padding='same', activation='linear')(features)
+        output_seg  = Conv2D(2,                   (1,1), name='seg', padding='same', activation='sigmoid')(features)
+        return Model([input_img,input_mask], [output_prob,output_dist,output_seg])
 
 
     def train(self, X, Y, validation_data, augmenter=None, seed=None, epochs=None, steps_per_epoch=None):
@@ -349,20 +363,20 @@ class StarDist2D(StarDistBase):
         n_data_val = len(data_val)
         n_take = self.config.train_n_val_patches if self.config.train_n_val_patches is not None else n_data_val
         ids = tuple(np.random.choice(n_data_val, size=n_take, replace=(n_take > n_data_val)))
-        Xv, Mv, Pv, Dv = [None]*n_take, [None]*n_take, [None]*n_take, [None]*n_take
+        Xv, Mv, Pv, Dv, Lv = [None]*n_take, [None]*n_take, [None]*n_take, [None]*n_take, [None]*n_take
         for i,k in enumerate(ids):
-            (Xv[i],Mv[i]),(Pv[i],Dv[i]) = data_val[k]
-        Xv, Mv, Pv, Dv = np.concatenate(Xv,axis=0), np.concatenate(Mv,axis=0), np.concatenate(Pv,axis=0), np.concatenate(Dv,axis=0)
-        data_val = [[Xv,Mv],[Pv,Dv]]
+            (Xv[i],Mv[i]),(Pv[i],Dv[i],Lv[i]) = data_val[k]
+        Xv, Mv, Pv, Dv, Lv = np.concatenate(Xv,axis=0), np.concatenate(Mv,axis=0), np.concatenate(Pv,axis=0), np.concatenate(Dv,axis=0), np.concatenate(Lv,axis=0)
+        data_val = [[Xv,Mv],[Pv,Dv,Lv]]
 
         data_train = StarDistData2D(X, Y, batch_size=self.config.train_batch_size, augmenter=augmenter, **data_kwargs)
 
-        for cb in self.callbacks:
-            if isinstance(cb,CARETensorBoard):
-                # show dist for three rays
-                _n = min(3, self.config.n_rays)
-                cb.output_slices = [[slice(None)]*4,[slice(None)]*4]
-                cb.output_slices[1][1+axes_dict(self.config.axes)['C']] = slice(0,(self.config.n_rays//_n)*_n,self.config.n_rays//_n)
+        # for cb in self.callbacks:
+        #     if isinstance(cb,CARETensorBoard):
+        #         # show dist for three rays
+        #         _n = min(3, self.config.n_rays)
+        #         cb.output_slices = [[slice(None)]*4,[slice(None)]*4]
+        #         cb.output_slices[1][1+axes_dict(self.config.axes)['C']] = slice(0,(self.config.n_rays//_n)*_n,self.config.n_rays//_n)
 
         history = self.keras_model.fit_generator(generator=data_train, validation_data=data_val,
                                                  epochs=epochs, steps_per_epoch=steps_per_epoch,
